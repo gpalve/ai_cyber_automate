@@ -122,45 +122,65 @@ def scrape_infosecurity():
     response = requests.get(base_url, headers=headers)
     soup = BeautifulSoup(response.text, "html.parser")
     articles = []
-    # Find all main news article links (h2, h3, h4 > a)
-    for heading in soup.select("h2 > a, h3 > a, h4 > a"):
-        title = heading.get_text(strip=True)
-        article_url = heading['href']
-        if not article_url.startswith('http'):
-            article_url = base_url + article_url
-        # Try to find the date in the next siblings or parent
-        date = None
-        summary = None
-        parent = heading.find_parent()
-        # Look for a [NEWS]DATE or similar pattern in the next siblings
-        next_el = parent.find_next_sibling()
-        while next_el and not date:
-            text = next_el.get_text(" ", strip=True)
-            if "NEWS" in text and any(char.isdigit() for char in text):
-                # Extract date after NEWS
-                parts = text.split("NEWS")
-                if len(parts) > 1:
-                    date = parts[1].strip()
-            next_el = next_el.find_next_sibling()
-        # Try to find a summary in the next paragraph
-        summary_tag = parent.find_next_sibling('p')
-        if summary_tag:
-            summary = summary_tag.get_text(strip=True)
-        articles.append({
-            "title": title,
-            "date": date,
-            "summary": summary,
-            "article_url": article_url
-        })
-        if len(articles) >= 10:
+    # Find all columns with news items
+    col_divs = soup.find_all("div", class_="col-1-3")
+    seen_urls = set()
+    for col in col_divs:
+        content_items = col.find_all("div", class_="content-item")
+        for item in content_items:
+            if len(articles) >= 8:
+                break
+            info_div = item.find("div", class_="content-info")
+            if not info_div:
+                continue
+            headline_tag = info_div.find("h3", class_="content-headline")
+            a_tag = headline_tag.find("a") if headline_tag else None
+            title = a_tag.get_text(strip=True) if a_tag else None
+            article_url = a_tag["href"] if a_tag and a_tag.has_attr("href") else None
+            if article_url and not article_url.startswith("http"):
+                article_url = base_url + article_url
+            # Skip duplicates by article_url
+            if article_url in seen_urls:
+                continue
+            seen_urls.add(article_url)
+            # Timestamp using carbon for formatting
+            meta_div = info_div.find("div", class_="content-meta")
+            timestamp = None
+            if meta_div:
+                time_tag = meta_div.find("time")
+                if time_tag and time_tag.has_attr("datetime"):
+                    try:
+                        import carbon
+                        dt = carbon.Carbon.parse(time_tag["datetime"])
+                        timestamp = dt.format("j M Y, H:i")
+                    except Exception:
+                        timestamp = time_tag["datetime"]
+                elif time_tag:
+                    timestamp = time_tag.get_text(strip=True)
+            # Image
+            img_tag = item.find("img", class_="content-thumb")
+            image_url = img_tag["src"] if img_tag and img_tag.has_attr("src") else None
+            # Summary/teaser
+            teaser_tag = item.find("p", class_="content-teaser")
+            summary = teaser_tag.get_text(strip=True) if teaser_tag else None
+            articles.append({
+                "title": title,
+                "summary": summary,
+                "image_url": image_url,
+                "timestamp": timestamp,
+                "article_url": article_url
+            })
+        if len(articles) >= 8:
             break
     return articles
 
 @app.route('/infosecurity')
 def infosecurity_endpoint():
+    csv_path = "assets/csv/infosecurity.csv"
     data = scrape_infosecurity()
-    save_to_csv(data, "assets/csv/infosecurity.csv", columns=["title", "date", "summary", "article_url"])
-    return jsonify(data)
+    save_to_csv(data, csv_path, columns=["title", "summary", "image_url", "timestamp", "article_url"])
+    # Only return the first 8 articles for frontend compatibility
+    return jsonify(data[:8])
 
 # --- CyberScoop Scraper ---
 def scrape_cyberscoop():
@@ -173,23 +193,42 @@ def scrape_cyberscoop():
     if latest_posts_div:
         articles = latest_posts_div.find_all('article', class_='post-item')
         for article in articles:
+            # Title
             title_tag = article.find('h3', class_='post-item__title')
-            title = title_tag.get_text(strip=True) if title_tag else None
             link_tag = title_tag.find('a') if title_tag else None
+            title = link_tag.get_text(strip=True) if link_tag else (title_tag.get_text(strip=True) if title_tag else None)
             link = link_tag['href'] if link_tag and link_tag.has_attr('href') else None
+            # Image
             img_tag = article.find('img')
             img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else None
+            # Timestamp (fetch from article page)
+            timestamp = None
+            if link:
+                try:
+                    link_full = link if link.startswith('http') else 'https://cyberscoop.com' + link
+                    art_resp = requests.get(link_full, timeout=10)
+                    art_soup = BeautifulSoup(art_resp.text, 'html.parser')
+                    date_p = art_soup.find('p', class_='single-article__date')
+                    if date_p:
+                        time_tag = date_p.find('time')
+                        if time_tag and time_tag.has_attr('datetime'):
+                            timestamp = time_tag['datetime']
+                        elif time_tag:
+                            timestamp = time_tag.get_text(strip=True)
+                except Exception:
+                    pass
             posts.append({
                 'title': title,
                 'link': link,
-                'image_url': img_url
+                'image_url': img_url,
+                'timestamp': timestamp
             })
     return posts
 
 @app.route('/cyberscoop')
 def cyberscoop_endpoint():
     data = scrape_cyberscoop()
-    save_to_csv(data, "assets/csv/cyberscoop.csv", columns=["title", "link", "image_url"])
+    save_to_csv(data, "assets/csv/cyberscoop.csv", columns=["title", "link", "image_url", "timestamp"])
     return jsonify(data)
 
 # --- GBHackers Scraper ---
@@ -214,8 +253,12 @@ def scrape_gbhackers():
         title_tag = article.select_one('h3.entry-title.td-module-title a')
         anchor_link = title_tag.get("href") if title_tag else None
         title = title_tag.get("title") if title_tag else None
-        img_tag = article.select_one('div.td-module-thumb a img')
-        image_url = img_tag.get("src") if img_tag else None
+        # Fetch image from the correct <img> tag inside <a class="td-image-wrap">
+        img_tag = article.select_one('a.td-image-wrap img')
+        image_url = None
+        if img_tag:
+            # Prefer data-img-url if present, else src
+            image_url = img_tag.get("data-img-url") or img_tag.get("src")
         date_tag = article.select_one('span.td-post-date time')
         timestamp = date_tag.get_text(strip=True) if date_tag else None
         author_tag = article.select_one('span.td-post-author-name a')
@@ -268,16 +311,30 @@ def index():
 </head>
 <body class="bg-gray-100 min-h-screen flex flex-col items-center justify-start py-10">
     <h1 class="text-3xl font-bold mb-8">Cyber News Scraper</h1>
-    <div class="flex flex-wrap gap-4 mb-8">
+    <div class="flex flex-wrap gap-4 mb-8" id="button-group">
         {% for endpoint, label in endpoints %}
-        <button onclick="fetchNews('{{ endpoint }}')" class="px-6 py-3 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition font-semibold">
+        <button id="btn-{{ endpoint }}" onclick="fetchNews('{{ endpoint }}')" class="px-6 py-3 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition font-semibold">
             {{ label }}
         </button>
         {% endfor %}
     </div>
     <div id="news-container" class="w-full max-w-3xl space-y-6"></div>
     <script>
+        let activeBtn = null;
+        function setActiveButton(endpoint) {
+            if (activeBtn) {
+                activeBtn.classList.remove('bg-blue-800', 'ring-4', 'ring-blue-300');
+                activeBtn.classList.add('bg-blue-600');
+            }
+            const btn = document.getElementById('btn-' + endpoint);
+            if (btn) {
+                btn.classList.remove('bg-blue-600');
+                btn.classList.add('bg-blue-800', 'ring-4', 'ring-blue-300');
+                activeBtn = btn;
+            }
+        }
         function fetchNews(endpoint) {
+            setActiveButton(endpoint);
             const container = document.getElementById('news-container');
             container.innerHTML = '<div class="text-center text-gray-500">Loading...</div>';
             fetch('/' + endpoint)

@@ -1,12 +1,15 @@
+
 import requests
 from bs4 import BeautifulSoup
 import os
 import pandas as pd
 import sys
 import time
+from flask import Flask, jsonify, render_template_string
 
-# Add Flask for web API
-from flask import Flask, jsonify, render_template_string  # add render_template_string
+# --- Import marktechpost and datasience scrapers ---
+from marktechpost_scraper import scrape_marktechpost
+from datasience_news import scrape_towardsdatascience
 
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
@@ -26,7 +29,8 @@ def scrape_deepmind(return_results=False):
     for card in cards:
         anchor_link = card.get("href")
         if anchor_link and not anchor_link.startswith("http"):
-            anchor_link = "https://deepmind.google/discover/blog/" + anchor_link
+            # Use site root as base, not /discover/blog/
+            anchor_link = "https://deepmind.google" + anchor_link
 
         title_tag = card.select_one("p.glue-headline.glue-headline--headline-5")
         title = title_tag.get_text(strip=True) if title_tag else None
@@ -98,6 +102,9 @@ def scrape_wired(return_results=False):
 
     results = []
     articles = soup.find_all("div", class_=lambda x: x and "summary-item" in x)
+    print(f"[WIRED DEBUG] Found {len(articles)} articles on page.")
+    if not articles:
+        print("[WIRED WARNING] No articles found. The page structure may have changed.")
     for article in articles:
         anchor_tag = article.find("a", class_=lambda x: x and "summary-item__hed-link" in x, href=True)
         anchor_link = None
@@ -136,39 +143,56 @@ def scrape_wired(return_results=False):
                 article_soup = BeautifulSoup(article_resp.text, "html.parser")
                 content_div = article_soup.find("div", class_=lambda x: x and "body__inner-container" in x)
                 if content_div:
-                    long_desc = content_div.get_text(separator=" ", strip=True)
+                    # Get only the first 3 lines (split by linebreaks or periods)
+                    text = content_div.get_text(separator="\n", strip=True)
+                    # Split by lines, filter out empty lines
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    if len(lines) >= 3:
+                        long_desc = '\n'.join(lines[:3])
+                    else:
+                        # Fallback: try splitting by period if not enough lines
+                        sentences = [s.strip() for s in text.split('.') if s.strip()]
+                        long_desc = '. '.join(sentences[:3]) + ('.' if sentences else '')
             except Exception as e:
                 print(f"Failed to fetch long_desc for {anchor_link}: {e}")
 
-        results.append({
-            "title": title,
-            "image_url": image_url,
-            "timestamp": timestamp,
-            "author": author,
-            "source": url,
-            "published": False,
-            "anchor_link": anchor_link,
-            "long_desc": long_desc
-        })
+        # Only add if title is present (and optionally, at least one desc)
+        if title and (long_desc or image_url or anchor_link):
+            results.append({
+                "title": title,
+                "image_url": image_url,
+                "timestamp": timestamp,
+                "author": author,
+                "source": url,
+                "published": False,
+                "anchor_link": anchor_link,
+                "long_desc": long_desc
+            })
 
     if return_results:
         return results
 
     csv_path = "assets/csv/wired.csv"
+    abs_csv_path = os.path.abspath(csv_path)
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    if os.path.exists(csv_path):
-        df_existing = pd.read_csv(csv_path)
-        for col in ["anchor_link", "long_desc", "author"]:
-            if col not in df_existing.columns:
-                df_existing[col] = None
-    else:
-        df_existing = pd.DataFrame(columns=["title", "image_url", "timestamp", "author", "source", "published", "anchor_link", "long_desc"])
+    try:
+        if os.path.exists(csv_path):
+            df_existing = pd.read_csv(csv_path)
+            for col in ["anchor_link", "long_desc", "author"]:
+                if col not in df_existing.columns:
+                    df_existing[col] = None
+        else:
+            df_existing = pd.DataFrame(columns=["title", "image_url", "timestamp", "author", "source", "published", "anchor_link", "long_desc"])
 
-    new_df = pd.DataFrame(results)
-    combined_df = pd.concat([df_existing, new_df], ignore_index=True)
-    combined_df.drop_duplicates(subset=["title", "timestamp"], inplace=True)
-    combined_df.to_csv(csv_path, index=False)
-    print(f"Saved {len(combined_df)} unique news items to {csv_path}")
+        new_df = pd.DataFrame(results)
+        # Combine and deduplicate the entire DataFrame (including old CSV data)
+        combined_df = pd.concat([df_existing, new_df], ignore_index=True)
+        combined_df = combined_df.drop_duplicates(subset=["title"], keep='first').reset_index(drop=True)
+        print(f"[WIRED DEBUG] Writing {len(combined_df)} unique news items to {abs_csv_path}")
+        combined_df.to_csv(csv_path, index=False)
+        print(f"[WIRED SUCCESS] Saved {len(combined_df)} unique news items to {abs_csv_path}")
+    except Exception as e:
+        print(f"[WIRED ERROR] Failed to write CSV at {abs_csv_path}: {e}")
 
 def scrape_zdnet_ai_carousels(return_results=False, save_csv=False, image_dir="assets/images/img"):
     url = "https://www.zdnet.com/topic/artificial-intelligence/"
@@ -180,66 +204,71 @@ def scrape_zdnet_ai_carousels(return_results=False, save_csv=False, image_dir="a
 
     soup = BeautifulSoup(response.text, "html.parser")
     carousels = soup.find_all("div", class_="c-dynamicCarousel")
-    results = []
+    flat_results = []
 
     for carousel in carousels:
         section_title = carousel.find("h4", class_="c-sectionHeading")
         if not section_title:
             continue
         section_title = section_title.get_text(strip=True)
-        items = []
         for item in carousel.select(".c-listingCarouselHorizontal_item a"):
             title = item.get("title") or item.get_text(strip=True)
-            link = "https://www.zdnet.com" + item.get("href")
+            link = item.get("href")
+            if link and not link.startswith("http"):
+                link = "https://www.zdnet.com" + link
             img_tag = item.find("img")
             img_url = img_tag["src"] if img_tag and img_tag.get("src") else None
-            items.append({
+
+            # Try to fetch article page for a short description and timestamp (optional, fallback to None)
+            short_desc = None
+            timestamp = None
+            author = None
+            long_desc = None
+            if link:
+                try:
+                    article_resp = requests.get(link, headers=headers_zdnet, timeout=8)
+                    article_soup = BeautifulSoup(article_resp.text, "html.parser")
+                    # Try to get description
+                    desc_tag = article_soup.find("meta", attrs={"name": "description"})
+                    if desc_tag and desc_tag.get("content"):
+                        short_desc = desc_tag["content"]
+                    # Try to get timestamp
+                    time_tag = article_soup.find("time")
+                    if time_tag and time_tag.has_attr("datetime"):
+                        timestamp = time_tag["datetime"]
+                    # Try to get author
+                    author_tag = article_soup.find("span", class_="c-byline__authorName")
+                    if author_tag:
+                        author = author_tag.get_text(strip=True)
+                    # Try to get long description
+                    content_div = article_soup.find("div", class_="article-body")
+                    if content_div:
+                        long_desc = content_div.get_text(separator=" ", strip=True)
+                except Exception:
+                    pass
+
+            flat_results.append({
                 "title": title,
-                "url": link,
-                "image": img_url
-            })
-        if items:
-            results.append({
-                "section": section_title,
-                "articles": items
+                "short_desc": short_desc,
+                "image_url": img_url,
+                "timestamp": timestamp,
+                "author": author,
+                "source": url,
+                "published": False,
+                "anchor_link": link,
+                "long_desc": long_desc,
+                "category": section_title
             })
 
     if save_csv:
-        rows = []
-        os.makedirs(image_dir, exist_ok=True)
-        for section in results:
-            for idx, article in enumerate(section["articles"]):
-                image_url = article["image"]
-                image_filename = f"{section['section'].replace(' ', '_')}_{idx+1}"
-                local_image_path = None
-                if image_url:
-                    try:
-                        resp = requests.get(image_url, stream=True, timeout=10)
-                        resp.raise_for_status()
-                        ext = os.path.splitext(image_url)[1].split('?')[0]
-                        if not ext or len(ext) > 5:
-                            ext = '.jpg'
-                        filepath = os.path.join(image_dir, image_filename + ext)
-                        with open(filepath, 'wb') as f:
-                            for chunk in resp.iter_content(1024):
-                                f.write(chunk)
-                        local_image_path = filepath
-                    except Exception:
-                        local_image_path = None
-                rows.append({
-                    "section": section["section"],
-                    "title": article["title"],
-                    "url": article["url"],
-                    "image": local_image_path if local_image_path else image_url
-                })
-        df = pd.DataFrame(rows)
         csv_path = "assets/csv/zdnet_ai_carousels.csv"
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        df = pd.DataFrame(flat_results)
         df.to_csv(csv_path, index=False)
         print(f"Saved {len(df)} rows to {csv_path}")
 
     if return_results:
-        return results
+        return flat_results
 
 def scrape_nvidia(return_results=False, save_csv=False):
     url = "https://developer.nvidia.com/blog/"
@@ -587,7 +616,17 @@ def scrape_ainews(return_results=False, save_csv=True):
         return results
 
 # --- Flask web server ---
+
 app = Flask(__name__)
+@app.route("/marktechpost")
+def marktechpost_api():
+    results = scrape_marktechpost(return_results=True, save_csv=True)
+    return jsonify(results)
+
+@app.route("/datascience")
+def datascience_api():
+    results = scrape_towardsdatascience(return_results=True, save_csv=True)
+    return jsonify(results)
 
 @app.route("/deepmind")
 def deepmind_api():
@@ -596,7 +635,19 @@ def deepmind_api():
 
 @app.route("/wired")
 def wired_api():
-    results = scrape_wired(return_results=True)  # No save_csv param, always saves in function
+    # Always write CSV (update the file)
+    scrape_wired(return_results=False)
+    # Now read all news from the CSV file
+    csv_path = "assets/csv/wired.csv"
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        results = df.fillna("").to_dict(orient="records")
+    else:
+        results = []
+    # Patch: ensure 'short_desc' is present for frontend compatibility
+    for item in results:
+        if 'short_desc' not in item or not item.get('short_desc'):
+            item['short_desc'] = item.get('short_description') or item.get('long_desc') or ''
     return jsonify(results)
 
 @app.route("/zdnet")
@@ -634,25 +685,44 @@ def index():
     <meta charset="UTF-8">
     <title>AI News Scraper</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@dotlottie/player-component@2.7.12/dist/dotlottie-player.mjs" type="module"></script>
 </head>
 <body class="bg-gray-100 min-h-screen flex flex-col items-center justify-start py-10">
     <h1 class="text-3xl font-bold mb-8">AI News Scraper</h1>
-    <div class="flex flex-wrap gap-4 mb-8">
+    <div class="flex flex-wrap gap-4 mb-8" id="button-group">
         {% for endpoint, label in endpoints %}
-        <button onclick="fetchNews('{{ endpoint }}')" class="px-6 py-3 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition font-semibold">
+        <button id="btn-{{ endpoint }}" onclick="fetchNews('{{ endpoint }}')" class="px-6 py-3 bg-blue-600 text-white rounded-lg shadow hover:bg-blue-700 transition font-semibold">
             {{ label }}
         </button>
         {% endfor %}
     </div>
     <div id="news-container" class="w-full max-w-3xl space-y-6"></div>
     <script>
+        let activeBtn = null;
+        function setActiveButton(endpoint) {
+            if (activeBtn) {
+                activeBtn.classList.remove('bg-blue-800', 'ring-4', 'ring-blue-300');
+                activeBtn.classList.add('bg-blue-600');
+            }
+            const btn = document.getElementById('btn-' + endpoint);
+            if (btn) {
+                btn.classList.remove('bg-blue-600');
+                btn.classList.add('bg-blue-800', 'ring-4', 'ring-blue-300');
+                activeBtn = btn;
+            }
+        }
+
+        function showSpinner() {
+            return `<div class='flex justify-center items-center py-8'><svg class='animate-spin h-8 w-8 text-blue-600' xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24'><circle class='opacity-25' cx='12' cy='12' r='10' stroke='currentColor' stroke-width='4'></circle><path class='opacity-75' fill='currentColor' d='M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z'></path></svg></div>`;
+        }
+
         function fetchNews(endpoint) {
+            setActiveButton(endpoint);
             const container = document.getElementById('news-container');
-            container.innerHTML = '<div class="text-center text-gray-500">Loading...</div>';
+            container.innerHTML = showSpinner();
             fetch('/' + endpoint)
                 .then(resp => resp.json())
                 .then(data => {
-                    // Support both list and dict (for endpoints with error)
                     if (Array.isArray(data)) {
                         if (data.length === 0) {
                             container.innerHTML = '<div class="text-gray-500">No news found.</div>';
@@ -683,6 +753,8 @@ def index():
                     container.innerHTML = '<div class="text-red-500">Failed to load news.</div>';
                 });
         }
+
+        // No auto-load: news will only load when a button is clicked
     </script>
 </body>
 </html>
@@ -694,11 +766,9 @@ def index():
         ("forbes", "Forbes"),
         ("thegradient", "The Gradient"),
         ("ainews", "AI News"),
-        ("cyberexpress", "CyberExpress"),
-        ("arstechnica", "ArsTechnica"),
-        ("infosecurity", "InfoSecurity"),
-        ("cyberscoop", "CyberScoop"),
-        ("gbhackers", "GBHackers"),
+        ("marktechpost", "Marktechpost"),
+        ("datascience", "Towards Data Science"),
+        
     ])
 
 if __name__ == "__main__":
